@@ -8,6 +8,7 @@ lives only in the references, and no reference duplicates core content.
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -468,6 +469,103 @@ def test_powershell_translator_rejects_unknown_bash():
     assert gen._translate_bash_block([gen._FIND_CHUNKS_POSIX]) == [gen._FIND_CHUNKS_PS]
 
 
+def test_mktemp_capture_translates_to_gettempfilename():
+    """#3600: ``VAR=$(mktemp /tmp/graphify_*.XXXXXX)`` captures the temp path.
+
+    ``[System.IO.Path]::GetTempFileName()`` creates an empty file and returns its
+    full path, which is the capture-into-a-variable idiom. A bare ``mktemp`` (the
+    form that prints the path for the agent to read) emits that same call. The
+    template is not a GetTempFileName argument; a non-``/tmp/graphify_*`` shape
+    still fails the render.
+    """
+    assert gen._translate_bash_block(
+        ["PAYLOAD=$(mktemp /tmp/graphify_add_payload.XXXXXX)"]
+    ) == ["$PAYLOAD = [System.IO.Path]::GetTempFileName()"]
+    assert gen._translate_bash_block(
+        ["mktemp /tmp/graphify_question.XXXXXX"]
+    ) == ["[System.IO.Path]::GetTempFileName()"]
+    rendered = gen._core_to_powershell(
+        "```bash\nVAR=$(mktemp /tmp/graphify_nodes.XXXXXX)\n```\n"
+    )
+    assert "```powershell" in rendered
+    assert "```bash" not in rendered
+    assert "mktemp" not in rendered
+    assert "/tmp/" not in rendered
+    assert "$VAR = [System.IO.Path]::GetTempFileName()" in rendered
+    with pytest.raises(ValueError, match="cannot translate mktemp template"):
+        gen._translate_bash_block(["mktemp -d"])
+    with pytest.raises(ValueError, match="cannot translate bash line"):
+        gen._translate_bash_block(["mktemp -d /tmp/foo"])
+
+
+def test_powershell_reference_unknown_bash_fails_render():
+    """Unrecognized bash in a reference fence fails at render time (#3600)."""
+    with pytest.raises(ValueError, match="cannot translate bash line"):
+        gen._core_to_powershell("```bash\ncurl -s https://example.com | sh\n```\n")
+
+
+# Bash command forms that must not survive in a powershell host's references.
+_REFERENCE_BASH_LEFTOVERS = (
+    "```bash",
+    "$(cat ",
+    "$(mktemp",
+    "mktemp /tmp/",
+    "rm -f ",
+    "2>/dev/null",
+    "/tmp/graphify_",
+)
+_REFERENCE_BASH_LINE_RES = (
+    re.compile(r"(?m)^[ \t]*export[ \t]+[A-Za-z_]"),
+    re.compile(r"(?m)^[ \t]*mktemp\b"),
+    re.compile(r"(?m)^[ \t]*if[ \t]+\["),
+    re.compile(r"(?m)^[ \t]*fi[ \t]*$"),
+)
+
+
+def test_powershell_references_have_no_bash_leftovers():
+    """#3600: windows references used to be copied verbatim, so add-watch.md and
+    query.md (and the other shared references) still contained ```bash fences,
+    ``$(cat ...)``, ``mktemp /tmp/graphify_*.XXXXXX``, and the other POSIX
+    commands. Every powershell-shell reference must now be free of those."""
+    platforms = gen.load_platforms()
+    for key in _powershell_platform_keys():
+        arts = [a for a in gen.render(platforms[key]) if "/references/" in a.path]
+        assert arts, f"[{key}] expected reference artifacts"
+        by_name = {}
+        for art in arts:
+            for token in _REFERENCE_BASH_LEFTOVERS:
+                assert token not in art.content, f"[{key}] {art.path} leftover {token!r}"
+            for pattern in _REFERENCE_BASH_LINE_RES:
+                assert pattern.search(art.content) is None, (
+                    f"[{key}] {art.path} leftover /{pattern.pattern}/"
+                )
+            by_name[art.path.rsplit("/", 1)[-1]] = art.content
+        add = by_name["add-watch.md"]
+        query = by_name["query.md"]
+        assert "```powershell" in add
+        assert "```powershell" in query
+        assert "& (Get-Content graphify-out\\.graphify_python) -m graphify.watch" in add
+        assert "$((Get-Content graphify-out\\.graphify_root).ToString().Trim())" in add
+        assert "'@ | & (Get-Content graphify-out\\.graphify_python) -" in query
+        update = by_name["update.md"]
+        assert "if (-not (Test-Path 'graphify-out/.graphify_extract.json')) {" in update
+        assert "Copy-Item graphify-out\\graph.json graphify-out\\.graphify_old.json" in update
+        assert "$env:GRAPHIFY_WHISPER_MODEL = 'base'" in by_name["transcribe.md"]
+        merge = by_name["github-and-merge.md"]
+        assert "$LOCAL_PATH = $(graphify clone <github-url> [--branch <branch>])" in merge
+        assert "$HOME/.graphify/repos/" in merge
+        assert "graphify merge-graphs `" in merge
+
+
+def test_posix_references_keep_bash_fences():
+    """The reference translation is scoped to powershell-shell hosts."""
+    _, refs = _platform_artifacts("claude")
+    assert "```bash" in refs["add-watch.md"]
+    assert "```bash" in refs["query.md"]
+    assert "```powershell" not in refs["add-watch.md"]
+    assert "$(cat graphify-out/.graphify_python)" in refs["query.md"]
+
+
 def test_posix_hosts_keep_their_bash_invocations():
     """The translation is scoped to powershell-shell hosts: the POSIX core keeps
     its ``$(cat ...) -c`` blocks and bash fences byte-for-byte."""
@@ -772,11 +870,13 @@ def test_always_on_roundtrip_is_byte_faithful():
         "When the user types `/graphify`, use the installed graphify skill or instructions "
         "before doing anything else."
     )
-    # The registry holds the #1530 substitution plus the query-first and graph-diff rules.
+    # The registry holds the #1530 substitution plus the query-first, graph-diff
+    # and section-text rules.
     assert gen.ALWAYS_ON_SANCTIONED_EDITS["_AGENTS_MD_SECTION"] == (
         (old_instruction, new_instruction),
         gen._QUERY_FIRST_EDIT,
         gen._GRAPH_DIFF_EDIT,
+        gen._SECTION_EDIT,
     )
     baseline_agents = gen._always_on_constants(gen.ALWAYS_ON_BASELINE_REF)["_AGENTS_MD_SECTION"]
     # The ONLY divergences from the frozen baseline are the sanctioned edits —
@@ -784,7 +884,8 @@ def test_always_on_roundtrip_is_byte_faithful():
     assert old_instruction in baseline_agents
     baseline_agents = baseline_agents.replace(*gen._QUERY_FIRST_EDIT)
     old_rule, new_rule = gen._GRAPH_DIFF_EDIT
-    assert baseline_agents.replace(old_instruction, new_instruction).replace(old_rule, new_rule) == rendered_agents
+    replayed = baseline_agents.replace(old_instruction, new_instruction).replace(old_rule, new_rule)
+    assert replayed.replace(*gen._SECTION_EDIT) == rendered_agents
     assert "`skill` tool" not in rendered_agents
     assert 'skill: "graphify"' not in rendered_agents
 
@@ -1179,10 +1280,16 @@ def _step_body(core: str, marker: str) -> str:
 
 
 def _substituted(body: str, root: Path) -> str:
-    """Apply the substitutions the skill tells the agent to make (INPUT_PATH/SPEC_PATH)."""
+    """Apply the substitution the skill still asks the agent to make (SPEC_PATH),
+    and simulate Step 1 writing the trusted scan root to .graphify_root, which the
+    blocks read for INPUT_PATH since #4762 (callers chdir to ``root`` so the
+    relative ``graphify-out/.graphify_root`` resolves there)."""
     spec = root / "extraction-spec.md"
     spec.write_text("extraction prompt fixture\n", encoding="utf-8")
-    return body.replace("'INPUT_PATH'", repr(str(root))).replace("'SPEC_PATH'", repr(str(spec)))
+    out = root / "graphify-out"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / ".graphify_root").write_text(str(root), encoding="utf-8")
+    return body.replace("'SPEC_PATH'", repr(str(spec)))
 
 
 def _write_chunk(out_dir: Path, payload: dict) -> None:
@@ -1195,9 +1302,9 @@ def _write_chunk(out_dir: Path, payload: dict) -> None:
 def test_extraction_specs_demand_complete_reads_and_report_coverage():
     """Every host's subagent prompt states the Read cap and asks for coverage.
 
-    Both spec variants must carry it: the compact prompt ships to codex/claw/
-    kiro/pi, the verbose one everywhere else, so fixing only one leaves hosts
-    silently half-reading files.
+    Every spec variant must carry it: the compact prompt ships to codex, its
+    disk-writing twin to claw/kiro/pi, the verbose one everywhere else, so
+    fixing only one leaves hosts silently half-reading files.
     """
     platforms = gen.load_platforms()
     seen_variants = set()
@@ -1211,9 +1318,33 @@ def test_extraction_specs_demand_complete_reads_and_report_coverage():
         assert "coverage" in spec, f"[{key}] the prompt never asks for a coverage report"
         # The contract must be in the schema the subagent emits, not only the prose.
         assert '"coverage":{' in spec, f"[{key}] the emitted schema carries no coverage field"
-    assert seen_variants == {"verbose", "compact"}, (
-        "this test must cover both spec variants, not just one"
+    assert seen_variants == {"verbose", "compact", "compact-disk"}, (
+        "this test must cover every spec variant, not just one"
     )
+
+
+def test_extraction_spec_writes_chunk_path_when_dispatch_passes_one():
+    """A host whose dispatch substitutes CHUNK_PATH must get a spec that writes it.
+
+    claw/kiro/pi dispatch says "have it write the result to CHUNK_PATH", but
+    they used to ship the compact spec, which never named CHUNK_PATH — so a
+    subagent following the prompt verbatim returned JSON inline and Step B3
+    found no chunk file. Codex is the inverse: its workers return JSON and the
+    orchestrator writes the file, so its spec must not ask for a write.
+    """
+    platforms = gen.load_platforms()
+    for key, platform in sorted(platforms.items()):
+        if platform.bucket != "split":
+            continue
+        core = _platform_artifacts(key)[0]
+        spec = _platform_artifacts(key)[1]["extraction-spec.md"]
+        if "CHUNK_PATH must be an **absolute** path" in core:
+            assert "and CHUNK_PATH)" in spec, f"[{key}] spec omits CHUNK_PATH from its substitutions"
+            assert spec.rstrip().endswith("CHUNK_PATH\n```"), (
+                f"[{key}] spec never tells the subagent to write its JSON to CHUNK_PATH"
+            )
+        if "return the JSON inline" in core:
+            assert "CHUNK_PATH" not in spec, f"[{key}] spec asks for a CHUNK_PATH the dispatch never passes"
 
 
 def test_core_bounds_semantic_chunks_by_lines_as_well_as_file_count():
@@ -1365,3 +1496,224 @@ def test_step4_skill_honors_force_flag_on_shrink(tmp_path, capsys, monkeypatch):
     assert len(persisted5["nodes"]) == 10
     assert persisted5["nodes"][0]["community_name"] == "Test Community"
 
+
+# --- #2225 follow-up: a file the subagent never reported is unread, not complete ---
+#
+# Step B3.5 compares REPORTED counts with real length, so a file with no coverage
+# entry passed it: a subagent that never opened a file could still emit nodes for
+# it, guessed from its name, and those nodes were cached and stamped as complete.
+# Step B3.5 now also treats a missing (or 0) entry as unread: it drops what the
+# chunks attribute to that file by source_file and flags it partial so it is retried
+# (graphify.cache.drop_unreported_chunk_sources).
+
+def _unreported_fixture(tmp_path: Path) -> dict:
+    """A chunk where read.md was read, never.md/zero.md were not, plus edge cases."""
+    import json as _json
+
+    out = tmp_path / "graphify-out"
+    out.mkdir(parents=True, exist_ok=True)
+    files = {
+        "read": tmp_path / "read.md",
+        "never": tmp_path / "never.md",
+        "zero": tmp_path / "zero.md",
+        "empty": tmp_path / "empty.md",
+        "pic": tmp_path / "pic.png",
+    }
+    files["read"].write_text("r\n" * 10, encoding="utf-8")
+    files["never"].write_text("n\n" * 20, encoding="utf-8")
+    files["zero"].write_text("z\n" * 5, encoding="utf-8")
+    files["empty"].write_text("", encoding="utf-8")
+    files["pic"].write_bytes(b"\x89PNG")
+    deleted = tmp_path / "deleted.md"  # dispatched, then deleted before Step B3 ran
+    dispatched = [files[k] for k in ("read", "never", "zero", "empty", "pic")] + [deleted]
+    (out / ".graphify_uncached.txt").write_text(
+        "\n".join(str(p) for p in dispatched), encoding="utf-8"
+    )
+
+    def node(node_id, src):
+        return {"id": node_id, "label": node_id, "file_type": "document", "source_file": str(src)}
+
+    def edge(s, t, src):
+        return {"source": s, "target": t, "relation": "references", "confidence": "INFERRED",
+                "confidence_score": 0.75, "source_file": str(src)}
+
+    def hyper(hid, ids, src):
+        return {"id": hid, "label": hid, "nodes": ids, "relation": "form",
+                "confidence": "INFERRED", "confidence_score": 0.75, "source_file": str(src)}
+
+    r, n, z, p = files["read"], files["never"], files["zero"], files["pic"]
+    _write_chunk(out, {
+        "nodes": [
+            node("read_a", r),
+            node("shared", r),          # the same deterministic id minted by a read file...
+            node("shared", n),          # ...and by an unread one: the read copy must survive
+            node("never_guess", n),
+            node("zero_guess", z),
+            node("pic_p", p),
+        ],
+        "edges": [
+            edge("read_a", "never_guess", r),   # points at a dropped node -> dropped
+            edge("read_a", "shared", r),        # the shared id survives -> kept
+            edge("read_a", "pic_p", n),         # guessed by the unread file -> dropped
+            edge("read_a", "src_main_run", r),  # an AST node outside the chunks -> kept
+        ],
+        "hyperedges": [
+            hyper("h_zero", ["read_a", "zero_guess", "pic_p"], r),  # touches a dropped node
+            hyper("h_kept", ["read_a", "shared", "pic_p"], r),
+            hyper("h_never", ["read_a", "shared", "pic_p"], n),     # attributed to an unread file
+        ],
+        "coverage": {str(r): 10, str(z): 0},
+        "input_tokens": 0, "output_tokens": 0,
+    })
+    # Part A's AST output: never.md also guessed the code id src_lib_util, so read.md's
+    # edge to that real AST node must survive even though never.md's copy is dropped.
+    (out / ".graphify_ast.json").write_text(_json.dumps({"nodes": [
+        {"id": "src_main_run", "label": "run", "file_type": "code", "source_file": "src/main.py"},
+        {"id": "src_lib_util", "label": "util", "file_type": "code", "source_file": "src/lib.py"},
+    ], "edges": []}), encoding="utf-8")
+    d = _json.loads((out / ".graphify_chunk_01.json").read_text(encoding="utf-8"))
+    d["nodes"].append(node("src_lib_util", n))
+    d["edges"].append(edge("read_a", "src_lib_util", r))
+    (out / ".graphify_chunk_01.json").write_text(_json.dumps(d), encoding="utf-8")
+    files["chunk"] = out / ".graphify_chunk_01.json"
+    files["out"] = out
+    return files
+
+
+def test_drop_unreported_chunk_sources_drops_by_source_file_and_returns_unread(tmp_path):
+    """The library helper: unread files found, their items dropped, read files untouched."""
+    import json as _json
+
+    from graphify.cache import drop_unreported_chunk_sources
+
+    f = _unreported_fixture(tmp_path)
+    unread, dropped = drop_unreported_chunk_sources(f["out"], tmp_path)
+    assert unread == [str(f["never"]), str(f["zero"])], (
+        f"only unread files may be returned (not the image, the empty or the deleted file), got {unread}"
+    )
+    assert dropped == 8, dropped  # 4 nodes, 2 edges, 2 hyperedges
+
+    d = _json.loads(f["chunk"].read_text(encoding="utf-8"))
+    kept_nodes = sorted((n["id"], Path(n["source_file"]).name) for n in d["nodes"])
+    assert kept_nodes == [("pic_p", "pic.png"), ("read_a", "read.md"), ("shared", "read.md")], kept_nodes
+    assert sorted((e["source"], e["target"]) for e in d["edges"]) == [
+        ("read_a", "shared"), ("read_a", "src_lib_util"), ("read_a", "src_main_run"),
+    ], d["edges"]
+    assert [h["id"] for h in d["hyperedges"]] == ["h_kept"], d["hyperedges"]
+
+    # Idempotent: a second call finds the same files and drops nothing more.
+    assert drop_unreported_chunk_sources(f["out"], tmp_path) == (unread, 0)
+
+
+def test_drop_unreported_chunk_sources_without_a_dispatch_list_is_a_no_op(tmp_path):
+    """No .graphify_uncached.txt (nothing dispatched): nothing is unread, nothing is touched."""
+    from graphify.cache import drop_unreported_chunk_sources
+
+    f = _unreported_fixture(tmp_path)
+    (f["out"] / ".graphify_uncached.txt").unlink()
+    before = f["chunk"].read_bytes()
+    assert drop_unreported_chunk_sources(f["out"], tmp_path) == ([], 0)
+    assert f["chunk"].read_bytes() == before
+
+
+def test_drop_unreported_chunk_sources_ignores_chunks_without_a_coverage_contract(tmp_path):
+    """No chunk reports coverage at all (an older producer): nothing is judged or dropped."""
+    import json as _json
+
+    from graphify.cache import drop_unreported_chunk_sources
+
+    f = _unreported_fixture(tmp_path)
+    d = _json.loads(f["chunk"].read_text(encoding="utf-8"))
+    del d["coverage"]
+    f["chunk"].write_text(_json.dumps(d), encoding="utf-8")
+    before = f["chunk"].read_bytes()
+    assert drop_unreported_chunk_sources(f["out"], tmp_path) == ([], 0)
+    assert f["chunk"].read_bytes() == before
+
+
+def test_drop_unreported_chunk_sources_leaves_a_chunk_without_coverage_unjudged(tmp_path):
+    """Mixed run: a second chunk that wrote no coverage map keeps its files' items."""
+    import json as _json
+
+    from graphify.cache import drop_unreported_chunk_sources
+
+    f = _unreported_fixture(tmp_path)
+    other = tmp_path / "other.md"
+    other.write_text("o\n" * 8, encoding="utf-8")
+    with (f["out"] / ".graphify_uncached.txt").open("a", encoding="utf-8") as fh:
+        fh.write(f"\n{other}")
+    second = f["out"] / ".graphify_chunk_02.json"
+    second.write_text(_json.dumps({
+        "nodes": [{"id": "other_x", "label": "x", "file_type": "document", "source_file": str(other)}],
+        "edges": [], "hyperedges": [],
+    }), encoding="utf-8")
+
+    unread, _ = drop_unreported_chunk_sources(f["out"], tmp_path)
+    assert str(other) not in unread, unread
+    assert unread == [str(f["never"]), str(f["zero"])], unread
+    assert [n["id"] for n in _json.loads(second.read_text(encoding="utf-8"))["nodes"]] == ["other_x"]
+
+
+def test_coverage_step_flags_unreported_files_alongside_partly_read_ones(tmp_path, capsys, monkeypatch):
+    """Run the rendered Step B3.5: one write holds both kinds of flag, each once."""
+    import json as _json
+
+    monkeypatch.chdir(tmp_path)  # the emitted bodies address graphify-out/ relatively
+    core, _ = _platform_artifacts("claude")
+    body = _substituted(_step_body(core, "covered[src] = max("), tmp_path)
+    f = _unreported_fixture(tmp_path)
+    d = _json.loads(f["chunk"].read_text(encoding="utf-8"))
+    d["coverage"][str(f["read"])] = 4  # read.md was only partly read (4 of 10 lines)
+    f["chunk"].write_text(_json.dumps(d), encoding="utf-8")
+
+    exec(compile(body, "step-b35", "exec"), {"__name__": "__main__"})
+    printed = capsys.readouterr().out
+    assert "2 file(s) reported no coverage" in printed, printed
+    assert "read 4 of 10 lines" in printed, printed
+    flagged = (f["out"] / ".graphify_partial.txt").read_text(encoding="utf-8").splitlines()
+    # zero.md is both short (0 of 5) and unread: it must appear once.
+    assert sorted(flagged) == sorted(str(f[k]) for k in ("read", "never", "zero")), flagged
+    assert len(flagged) == len(set(flagged)), f"a file was flagged twice: {flagged}"
+
+
+def test_an_unreported_file_is_retried_instead_of_cached_as_complete(tmp_path, capsys, monkeypatch):
+    """End to end through the real merge and cache steps: the unread files come back as misses.
+
+    Before this, the never-opened file's guessed nodes were merged, cached as a complete
+    entry and served from the cache on every later --update.
+    """
+    from graphify.cache import check_semantic_cache
+
+    monkeypatch.chdir(tmp_path)
+    core, _ = _platform_artifacts("claude")
+    markers = ("covered[src] = max(", "Merged {len(chunks)} chunks", "partial_source_files=partial")
+    f = _unreported_fixture(tmp_path)
+    for marker in markers:
+        body = _substituted(_step_body(core, marker), tmp_path)
+        exec(compile(body, marker, "exec"), {"__name__": "__main__"})
+    assert "2 left partial for retry" in capsys.readouterr().out
+
+    spec = tmp_path / "extraction-spec.md"
+    _, _, _, uncached = check_semantic_cache(
+        [str(f["read"]), str(f["never"]), str(f["zero"])], root=tmp_path, prompt_file=spec
+    )
+    assert sorted(Path(u).name for u in uncached) == ["never.md", "zero.md"], (
+        f"never-read files must be re-dispatched and the read one must hit, uncached={uncached}"
+    )
+
+
+def test_extraction_specs_require_a_coverage_entry_for_every_file():
+    """Both spec variants ask for an entry per file, 0 for unopened, and pages for a PDF."""
+    platforms = gen.load_platforms()
+    seen_variants = set()
+    for key, platform in sorted(platforms.items()):
+        if platform.bucket != "split":
+            continue
+        spec = _platform_artifacts(key)[1]["extraction-spec.md"]
+        seen_variants.add(platform.extraction)
+        assert "EVERY" in spec and "never opened" in spec, f"[{key}] no entry rule for unopened files"
+        assert "never derive" in spec.lower(), f"[{key}] no rule against nodes from file names"
+        assert "PDF" in spec, f"[{key}] no coverage unit for files read as pages"
+    assert seen_variants == {"verbose", "compact", "compact-disk"}, (
+        "this test must cover every spec variant, not just one"
+    )
